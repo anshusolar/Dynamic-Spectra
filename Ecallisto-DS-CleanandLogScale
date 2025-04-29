@@ -1,0 +1,205 @@
+import gzip
+from astropy.io import fits
+import numpy as np
+import matplotlib.pyplot as plt
+from glob import glob
+from datetime import datetime, timedelta
+import matplotlib.dates as mdates
+import matplotlib.ticker as ticker
+from matplotlib.ticker import LogLocator, ScalarFormatter, NullFormatter
+
+# Function to load FITS data
+def load_fits_data(file):
+    with fits.open(file) as hdu:
+        data = hdu[0].data.astype(np.float32)
+        hdr = hdu[0].header
+        t_start = hdr['CRVAL1']
+        dt = hdr['CDELT1']
+        nt = hdr['NAXIS1']
+        time_sec = t_start + dt * np.arange(nt)
+        date_str = hdr['DATE-OBS']
+        base_time = datetime.strptime(date_str, "%Y/%m/%d")
+        time_axis = [base_time + timedelta(seconds=float(s)) for s in time_sec]
+        freqs = hdu[1].data['Frequency'][0]
+        return time_axis, freqs, data
+
+def combine_and_plot(file_pattern_02, file_pattern_03, title, vmin=None, vmax=None):
+    # Load data for both file types
+    files_02 = sorted(glob(file_pattern_02))
+    files_03 = sorted(glob(file_pattern_03))
+    print(f"Number of 02 files: {len(files_02)}")
+    print(f"Number of 03 files: {len(files_03)}")
+    
+    # Store data with associated times
+    data_02_list = []
+    time_02_list = []
+    data_03_list = []
+    time_03_list = []
+    freq_02 = None
+    freq_03 = None
+
+    # Process "02" files if available
+    if files_02:
+        for file in files_02:
+            t, f, d = load_fits_data(file)
+            time_02_list.append(t)
+            data_02_list.append(d)
+            if freq_02 is None:
+                freq_02 = f
+                print(f"02 file freq range: {f.min():.2f} to {f.max():.2f} MHz")
+        freq_02_flipped = np.flip(freq_02)[6:]
+        data_02_flipped = [np.flip(d, axis=0)[6:, :] for d in data_02_list]
+        time_02 = np.concatenate(time_02_list)
+        data_02_combined = np.hstack(data_02_flipped)
+    else:
+        freq_02_flipped = np.array([])
+        time_02 = np.array([])
+        data_02_combined = np.array([])
+
+    # Process "03" files if available
+    if files_03:
+        for file in files_03:
+            t, f, d = load_fits_data(file)
+            time_03_list.append(t)
+            data_03_list.append(d)
+            if freq_03 is None:
+                freq_03 = f
+                print(f"03 file freq range: {f.min():.2f} to {f.max():.2f} MHz")
+        freq_03_flipped = np.flip(freq_03)[6:]
+        data_03_flipped = [np.flip(d, axis=0)[6:, :] for d in data_03_list]
+        time_03 = np.concatenate(time_03_list)
+        data_03_combined = np.hstack(data_03_flipped)
+    else:
+        freq_03_flipped = np.array([])
+        time_03 = np.array([])
+        data_03_combined = np.array([])
+
+    # Combine time arrays based on availability
+    if files_02 and files_03:
+        all_times = np.concatenate([time_02, time_03])
+    elif files_02:
+        all_times = time_02
+    elif files_03:
+        all_times = time_03
+    else:
+        raise ValueError("No data files found.")
+    print(f"all_times shape: {all_times.shape}")
+
+    # Convert to numerical format and get unique times
+    time_num = mdates.date2num(all_times)
+    unique_times, unique_idx = np.unique(time_num, return_index=True)
+    time_combined = all_times[unique_idx]
+    print(f"unique_times shape: {unique_times.shape}")
+    print(f"time_combined shape: {time_combined.shape}")
+
+    # Create data arrays aligned with time_combined
+    n_times = len(time_combined)
+
+    # Align "02" data if present
+    if files_02:
+        data_02_aligned = np.full((len(freq_02_flipped), n_times), np.nan)
+        time_02_num = mdates.date2num(time_02)
+        idx_02 = np.searchsorted(unique_times, time_02_num)
+        valid = (idx_02 < n_times) & (idx_02 >= 0)
+        idx_02 = idx_02[valid]
+        if idx_02.size != data_02_combined.shape[1]:
+            print(f"Warning: Time mismatch for 02 files. Expected {data_02_combined.shape[1]}, got {idx_02.size}.")
+            if idx_02.size > data_02_combined.shape[1]:
+                idx_02 = idx_02[:data_02_combined.shape[1]]
+                data_02_combined = data_02_combined[:, :idx_02.size]
+        data_02_aligned[:, idx_02] = data_02_combined[:, :idx_02.size]
+        print(f"idx_02 shape: {idx_02.shape}, max index: {idx_02.max() if idx_02.size else 'N/A'}")
+    else:
+        data_02_aligned = np.array([])
+
+    # Align "03" data if present
+    if files_03:
+        data_03_aligned = np.full((len(freq_03_flipped), n_times), np.nan)
+        time_03_num = mdates.date2num(time_03)
+        idx_03 = np.searchsorted(unique_times, time_03_num)
+        valid = (idx_03 < n_times) & (idx_03 >= 0)
+        idx_03 = idx_03[valid]
+        if idx_03.size != data_03_combined.shape[1]:
+            print(f"Warning: Time mismatch for 03 files. Expected {data_03_combined.shape[1]}, got {idx_03.size}.")
+            if idx_03.size > data_03_combined.shape[1]:
+                idx_03 = idx_03[:data_03_combined.shape[1]]
+                data_03_combined = data_03_combined[:, :idx_03.size]
+        data_03_aligned[:, idx_03] = data_03_combined[:, :idx_03.size]
+        print(f"idx_03 shape: {idx_03.shape}, max index: {idx_03.max() if idx_03.size else 'N/A'}")
+    else:
+        data_03_aligned = np.array([])
+
+    # Combine frequency and data based on availability
+    if files_02 and files_03:
+        gap_rows = 5  # Number of gap rows
+        if freq_03_flipped.max() < freq_02_flipped.min():
+            gap = freq_02_flipped.min() - freq_03_flipped.max()
+            print(f"Gap between freq_03_flipped.max() and freq_02_flipped.min(): {gap:.2f} MHz")
+            freq_gap = np.linspace(freq_03_flipped.max(), freq_02_flipped.min(), gap_rows + 2)[1:-1]
+            freq_combined = np.concatenate([freq_03_flipped, freq_gap, freq_02_flipped])
+            data_gap = np.full((gap_rows, n_times), np.nan)
+            data_combined = np.vstack([data_03_aligned, data_gap, data_02_aligned])
+        else:
+            gap = freq_03_flipped.min() - freq_02_flipped.max()
+            print(f"Gap between freq_02_flipped.max() and freq_03_flipped.min(): {gap:.2f} MHz")
+            freq_gap = np.linspace(freq_02_flipped.max(), freq_03_flipped.min(), gap_rows + 2)[1:-1]
+            freq_combined = np.concatenate([freq_02_flipped, freq_gap, freq_03_flipped])
+            data_gap = np.full((gap_rows, n_times), np.nan)
+            data_combined = np.vstack([data_02_aligned, data_gap, data_03_aligned])
+    elif files_02:
+        freq_combined = freq_02_flipped
+        data_combined = data_02_aligned
+    elif files_03:
+        freq_combined = freq_03_flipped
+        data_combined = data_03_aligned
+    else:
+        raise ValueError("No data to plot.")
+
+    print(f"freq_combined shape: {freq_combined.shape}")
+    print(f"data_combined shape: {data_combined.shape}")
+
+    # Perform median subtraction along the time axis
+    median_spectrum = np.nanmedian(data_combined, axis=1, keepdims=True)
+    data_subtracted = data_combined - median_spectrum
+
+    # Print the range of data_subtracted to help set vmin and vmax
+    print(f"data_subtracted min: {np.nanmin(data_subtracted)}, max: {np.nanmax(data_subtracted)}")
+
+    # Prepare time and frequency coordinates for pcolormesh
+    time_edges = mdates.date2num(time_combined)
+    time_edges = np.concatenate([time_edges, [time_edges[-1] + (time_edges[-1] - time_edges[-2])]])
+    print(f"time_edges shape: {time_edges.shape}")
+
+    # Create frequency edges with one more point than data_combined rows
+    freq_edges = np.zeros(len(freq_combined) + 1)
+    freq_edges[0] = freq_combined[0]  # Start at the first frequency
+    freq_edges[1:-1] = (freq_combined[:-1] + freq_combined[1:]) / 2  # Midpoints
+    freq_edges[-1] = freq_combined[-1]  # End at the last frequency
+    print(f"freq_edges shape: {freq_edges.shape}")
+
+    plt.figure(figsize=(12, 8))
+    plt.pcolormesh(time_edges, freq_edges, data_subtracted, cmap='RdBu_r', vmin=vmin, vmax=vmax, shading='auto')
+    
+    # Set y-axis to log scale and apply clean formatting
+    plt.yscale('log')
+    plt.gca().yaxis.set_major_locator(LogLocator(base=10.0, subs=[1.0, 2.0, 5.0], numticks=15))
+    plt.gca().yaxis.set_major_formatter(ScalarFormatter())
+    plt.gca().yaxis.set_minor_formatter(NullFormatter())
+    
+    plt.colorbar(label='Intensity [digit units, median-subtracted]')
+    plt.xlabel('Time [UT]')
+    plt.ylabel('Frequency [MHz]')
+    plt.title(title + ' (Median-Subtracted)')
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    plt.gcf().autofmt_xdate()
+    plt.ylim(freq_combined[0], freq_combined[-1])
+    plt.tight_layout()
+    plt.savefig('dynamic_spectrum_median_subtracted_logfreq.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+
+
+# Call the function
+combine_and_plot("*UDAIPUR_*_02.fit.gz", "*UDAIPUR_*_03.fit.gz",
+                 "e-CALLISTO Combined Dynamic Spectrum ",
+                 vmin=-10, vmax=40)
