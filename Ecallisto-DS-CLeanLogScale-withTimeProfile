@@ -1,0 +1,180 @@
+import gzip
+from astropy.io import fits
+import numpy as np
+import matplotlib.pyplot as plt
+from glob import glob
+from datetime import datetime, timedelta
+import matplotlib.dates as mdates
+
+# Function to load FITS data
+def load_fits_data(file):
+    with fits.open(file) as hdu:
+        data = hdu[0].data.astype(np.float32)
+        hdr = hdu[0].header
+        t_start = hdr['CRVAL1']
+        dt = hdr['CDELT1']
+        nt = hdr['NAXIS1']
+        time_sec = t_start + dt * np.arange(nt)
+        date_str = hdr['DATE-OBS']
+        base_time = datetime.strptime(date_str, "%Y/%m/%d")
+        time_axis = [base_time + timedelta(seconds=float(s)) for s in time_sec]
+        freqs = hdu[1].data['Frequency'][0]
+    return time_axis, freqs, data
+
+# Function to combine data and plot dynamic spectrum
+def combine_and_plot(file_pattern_02, file_pattern_03, title, vmin=None, vmax=None):
+    files_02 = sorted(glob(file_pattern_02))
+    files_03 = sorted(glob(file_pattern_03))
+    
+    data_02_list, time_02_list = [], []
+    data_03_list, time_03_list = [], []
+    freq_02, freq_03 = None, None
+
+    # Load "02" files
+    if files_02:
+        for file in files_02:
+            t, f, d = load_fits_data(file)
+            time_02_list.append(t)
+            data_02_list.append(d)
+            if freq_02 is None:
+                freq_02 = f
+        freq_02_flipped = np.flip(freq_02)[6:]
+        data_02_flipped = [np.flip(d, axis=0)[6:, :] for d in data_02_list]
+        time_02 = np.concatenate(time_02_list)
+        data_02_combined = np.hstack(data_02_flipped)
+    else:
+        freq_02_flipped = np.array([])
+        time_02 = np.array([])
+        data_02_combined = np.array([])
+
+    # Load "03" files
+    if files_03:
+        for file in files_03:
+            t, f, d = load_fits_data(file)
+            time_03_list.append(t)
+            data_03_list.append(d)
+            if freq_03 is None:
+                freq_03 = f
+        freq_03_flipped = np.flip(freq_03)[6:]
+        data_03_flipped = [np.flip(d, axis=0)[6:, :] for d in data_03_list]
+        time_03 = np.concatenate(time_03_list)
+        data_03_combined = np.hstack(data_03_flipped)
+    else:
+        freq_03_flipped = np.array([])
+        time_03 = np.array([])
+        data_03_combined = np.array([])
+
+    # Combine time arrays
+    if files_02 and files_03:
+        all_times = np.concatenate([time_02, time_03])
+    elif files_02:
+        all_times = time_02
+    elif files_03:
+        all_times = time_03
+    else:
+        raise ValueError("No data files found.")
+    
+    time_num = mdates.date2num(all_times)
+    unique_times, unique_idx = np.unique(time_num, return_index=True)
+    time_combined = all_times[unique_idx]
+
+    # Align data to combined time axis
+    n_times = len(time_combined)
+    if files_02:
+        data_02_aligned = np.full((len(freq_02_flipped), n_times), np.nan)
+        time_02_num = mdates.date2num(time_02)
+        idx_02 = np.searchsorted(unique_times, time_02_num)
+        valid = (idx_02 < n_times) & (idx_02 >= 0)
+        idx_02 = idx_02[valid]
+        data_02_aligned[:, idx_02] = data_02_combined[:, :idx_02.size]
+    else:
+        data_02_aligned = np.array([])
+
+    if files_03:
+        data_03_aligned = np.full((len(freq_03_flipped), n_times), np.nan)
+        time_03_num = mdates.date2num(time_03)
+        idx_03 = np.searchsorted(unique_times, time_03_num)
+        valid = (idx_03 < n_times) & (idx_03 >= 0)
+        idx_03 = idx_03[valid]
+        data_03_aligned[:, idx_03] = data_03_combined[:, :idx_03.size]
+    else:
+        data_03_aligned = np.array([])
+
+    # Combine frequency and data
+    if files_02 and files_03:
+        gap_rows = 5
+        if freq_03_flipped.max() < freq_02_flipped.min():
+            freq_gap = np.linspace(freq_03_flipped.max(), freq_02_flipped.min(), gap_rows + 2)[1:-1]
+            freq_combined = np.concatenate([freq_03_flipped, freq_gap, freq_02_flipped])
+            data_gap = np.full((gap_rows, n_times), np.nan)
+            data_combined = np.vstack([data_03_aligned, data_gap, data_02_aligned])
+        else:
+            freq_gap = np.linspace(freq_02_flipped.max(), freq_03_flipped.min(), gap_rows + 2)[1:-1]
+            freq_combined = np.concatenate([freq_02_flipped, freq_gap, freq_03_flipped])
+            data_gap = np.full((gap_rows, n_times), np.nan)
+            data_combined = np.vstack([data_02_aligned, data_gap, data_03_aligned])
+    elif files_02:
+        freq_combined = freq_02_flipped
+        data_combined = data_02_aligned
+    elif files_03:
+        freq_combined = freq_03_flipped
+        data_combined = data_03_aligned
+
+    # Subtract median to remove background
+    median_spectrum = np.nanmedian(data_combined, axis=1, keepdims=True)
+    data_subtracted = data_combined - median_spectrum
+
+    # Plot dynamic spectrum (optional here)
+    plt.figure(figsize=(12, 8))
+    time_edges = np.concatenate([mdates.date2num(time_combined), 
+                                 [mdates.date2num(time_combined[-1]) + (mdates.date2num(time_combined[-1]) - mdates.date2num(time_combined[-2]))]])
+    freq_edges = np.concatenate([freq_combined, [freq_combined[-1]]])
+    plt.pcolormesh(time_edges, freq_edges, data_subtracted, cmap='RdBu_r', vmin=vmin, vmax=vmax)
+    plt.colorbar(label='Intensity [median-subtracted]')
+    plt.xlabel('Time [UT]')
+    plt.ylabel('Frequency [MHz]')
+    plt.title(title)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    plt.show()
+
+    return time_combined, freq_combined, data_subtracted
+
+# Function to plot 1D time profiles
+def plot_time_profile(time_combined, freq_combined, data_subtracted, frequencies):
+    plt.figure(figsize=(12, 6))
+    
+    for freq in frequencies:
+        # Find the closest frequency in freq_combined
+        idx = np.argmin(np.abs(freq_combined - freq))
+        closest_freq = freq_combined[idx]
+        print(f"Plotting time profile for {closest_freq:.2f} MHz (closest to {freq:.2f} MHz)")
+        
+        # Extract the intensity data for this frequency
+        time_series = data_subtracted[idx, :]
+        
+        # Plot it
+        plt.plot(time_combined, time_series, label=f"{closest_freq:.2f} MHz")
+
+    # Format the plot
+    plt.xlabel('Time [UT]')
+    plt.ylabel('Intensity [median-subtracted]')
+    plt.title('Time Profiles at Specified Frequencies')
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    plt.gcf().autofmt_xdate()
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# How to use it
+# Replace file patterns with your actual file paths
+time_combined, freq_combined, data_subtracted = combine_and_plot(
+    "*UDAIPUR_*_02.fit.gz",
+    "*UDAIPUR_*_03.fit.gz",
+    "Dynamic Spectrum",
+    vmin=-10, vmax=40
+)
+
+# Plot time profiles for the frequencies you define (e.g., 50 MHz and 150 MHz)
+plot_time_profile(time_combined, freq_combined, data_subtracted, frequencies=[40,80,160,240])
