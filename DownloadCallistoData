@@ -1,0 +1,133 @@
+# download callsito data
+
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from scipy.ndimage import gaussian_filter
+from skimage.measure import label, regionprops
+import matplotlib.patches as patches
+from datetime import datetime, timedelta
+import matplotlib.dates as mdates
+from matplotlib.ticker import LogLocator, ScalarFormatter, NullFormatter
+import requests
+from bs4 import BeautifulSoup
+import os
+import re
+import time
+from urllib.parse import urljoin
+
+# Function to download Udaipur FITS files for a given date
+def download_udaipur_files(date_str, download_dir="udaipur_data", max_retries=3):
+    """
+    Download all INDIA-UDAIPUR FITS files for a given date from e-CALLISTO archive.
+    
+    Parameters:
+    date_str (str): YYYYMMDD (e.g., '20250131')
+    download_dir (str): Directory to save downloaded files
+    max_retries (int): Maximum number of download retries
+    
+    Returns:
+    list: List of downloaded file paths
+    """
+    # Construct the e-CALLISTO archive URL
+    year, month, day = date_str[:4], date_str[4:6], date_str[6:8]
+    base_url = f"https://soleil.i4ds.ch/solarradio/data/2002-20yy_Callisto/{year}/{month}/{day}/"
+    
+    # Create download directory if it doesn't exist
+    os.makedirs(download_dir, exist_ok=True)
+    
+    # Scrape the directory listing with retries
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempt {attempt + 1} to access {base_url}")
+            response = requests.get(base_url, timeout=30)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            break
+        except (requests.RequestException, requests.Timeout) as e:
+            print(f"Error accessing {base_url}: {e}")
+            if attempt == max_retries - 1:
+                print("Max retries reached. Could not access directory listing.")
+                return []
+            time.sleep(5)  # Wait before retrying
+    
+    # Find all links to Udaipur FITS files
+    file_pattern = re.compile(rf"INDIA-UDAIPUR_{date_str}_\d{{6}}_0[23]\.fit\.gz")
+    file_links = []
+    
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        if file_pattern.match(href):
+            file_links.append(href)
+    
+    if not file_links:
+        print(f"No matching files found for date {date_str}")
+        return []
+    
+    # Download files with retries
+    downloaded_files = []
+    for file_link in file_links:
+        file_url = urljoin(base_url, file_link)
+        filename = os.path.join(download_dir, os.path.basename(file_link))
+        
+        # Skip if file already exists
+        if os.path.exists(filename):
+            print(f"File {filename} already exists. Skipping download.")
+            downloaded_files.append(filename)
+            continue
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"Downloading {file_url}... (Attempt {attempt + 1})")
+                response = requests.get(file_url, timeout=60)
+                response.raise_for_status()
+                
+                # Save file
+                with open(filename, 'wb') as f:
+                    f.write(response.content)
+                
+                downloaded_files.append(filename)
+                print(f"Successfully saved {filename}")
+                break
+            except (requests.RequestException, requests.Timeout) as e:
+                print(f"Error downloading {file_url}: {e}")
+                if attempt == max_retries - 1:
+                    print(f"Failed to download {file_url} after {max_retries} attempts")
+                time.sleep(5)  # Wait before retrying
+    
+    return downloaded_files
+
+# Modified main processing function with better date handling
+def process_day(date_str=None, download_dir=None):
+    print("Data credit: University of Applied Sciences and Arts Northwestern Switzerland (FHNW), Institute for Data Science.")
+    print("Contact: Christian Monstein, Istituto Ricerche Solari Locarno (IRSOL), monstein@irsol.ch")
+    
+    # Default to today's date if not provided
+    if date_str is None:
+        today = datetime.now().strftime("%Y%m%d")
+        date_str = input(f"Enter date in YYYYMMDD format (default: {today}): ") or today
+    
+    # Validate date format
+    try:
+        datetime.strptime(date_str, "%Y%m%d")
+    except ValueError:
+        print("Invalid date format. Please use YYYYMMDD.")
+        return
+    
+    # Set download directory
+    if download_dir is None:
+        download_dir = f"udaipur_{date_str}"
+    
+    # Download files
+    print(f"\nDownloading files for {date_str}...")
+    downloaded_files = download_udaipur_files(date_str, download_dir)
+    
+    if not downloaded_files:
+        print("No files downloaded. Exiting.")
+        return
+    
+    # [Rest of your process_day function remains the same]
+
+# Run the processing
+if __name__ == "__main__":
+    process_day()
