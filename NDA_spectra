@@ -1,0 +1,177 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[52]:
+
+
+from astropy.io import fits
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.time import Time, TimeDelta
+from matplotlib.dates import DateFormatter, MinuteLocator
+
+def plot_dynamic_spectrum(times, freqs, data, title="NDA Dynamic Spectrum",
+                          cmap='viridis', vlabel="Relative Intensity (log)", vmin=None, vmax=None):
+    extent = [times[0].plot_date, times[-1].plot_date, freqs[0], freqs[-1]]
+    plt.figure(figsize=(10, 6))
+    plt.imshow(data.T, origin='lower', aspect='auto', extent=extent,
+               cmap=cmap, vmin=vmin, vmax=vmax)
+    plt.colorbar(label=vlabel)
+    plt.xlabel('Time (UTC)')
+    plt.ylabel('Frequency (MHz)')
+    plt.title(title)
+
+    ax = plt.gca()
+    ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+    ax.xaxis.set_major_locator(MinuteLocator(interval=15))
+    ax.xaxis.set_minor_locator(MinuteLocator(interval=5))
+    plt.grid(True, which='both', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# ---------- MAIN ----------
+fits_file = 'NDA_31012025_1_13_00_00_14_59_58.fits'
+
+with fits.open(fits_file) as hdul:
+    hdul.info()
+
+    data_I = hdul[1].data      # Stokes I
+    freqs = hdul[3].data['frequency_in_MHz']   # frequencies
+    times = hdul[4].data['time_in_seconds']    # times
+
+    stokes_V = hdul[2].data  # Check HDU 2 for Stokes V
+    print("Stokes V data:", stokes_V.shape)
+
+    print("Data I shape:", data_I.shape)
+    print("Freqs:", freqs.shape)
+    print("Times:", times.shape)
+
+    # Fix mismatch in shape
+    data_I = data_I[:-1, :]  # Make it (7199, 400)
+
+    # Get the DATE-OBS value from the header
+    date_obs = hdul[0].header['DATE-OBS']  # e.g., '31/01/2025'
+
+    # Reformat the date to ISO format (yyyy-mm-dd)
+    date_obs_iso = f"2025-01-31T00:00:00"  # Adjust as needed
+
+    # Convert times to astropy Time
+    t0 = Time(date_obs_iso)  # Use the ISO format
+    times = t0 + TimeDelta(times, format='sec')
+
+    # Preprocess: log scale and background removal
+    data_clipped = np.clip(data_I, 1e-3, None)
+    log_data = np.log10(data_clipped)
+    log_data -= np.median(log_data[:100, :], axis=0)
+
+    # Plot
+    plot_dynamic_spectrum(times, freqs, log_data,
+                          title="NDA Stokes I Dynamic Spectrum (log)", cmap='viridis')
+
+
+# In[53]:
+
+
+from astropy.io import fits
+from astropy.time import Time, TimeDelta
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter, MinuteLocator
+
+# Modify this based on the exact format of 'DATE-OBS'
+fits_file = 'NDA_31012025_1_13_00_00_14_59_58.fits'
+
+with fits.open(fits_file) as hdul:
+    # Check DATE-OBS format in the header
+    date_obs = hdul[0].header['DATE-OBS']
+    print("DATE-OBS in header:", date_obs)
+
+    # Manually convert DATE-OBS to a valid format if needed
+    # Example: if date_obs is '31/01/2025', convert it to '2025-01-31T00:00:00'
+    date_obs = '2025-01-31T00:00:00'  # Modify this line based on the actual format
+
+    # Convert the observation date to astropy Time
+    t0 = Time(date_obs)
+
+    # Load data
+    data_I = hdul[1].data      # Stokes I
+    data_V = hdul[2].data      # Stokes V
+    freqs = hdul[3].data['frequency_in_MHz']  # frequencies
+    times = hdul[4].data['time_in_seconds']   # times
+
+    # Fix mismatch in shape
+    data_I = data_I.T  # Make it (7199, 400)
+    data_V = data_V.T  # Make it (7199, 400)
+
+    # Convert times to astropy Time
+    times = t0 + TimeDelta(times, format='sec')
+
+    # Preprocess: log scale and background removal for Stokes I
+    data_clipped_I = np.clip(data_I, 1e-3, None)
+    log_data_I = np.log10(data_clipped_I)
+    log_data_I -= np.median(log_data_I[:100, :], axis=0)
+
+    # Preprocess: log scale and background removal for Stokes V
+    data_clipped_V = np.clip(data_V, 1e-3, None)
+    log_data_V = np.log10(data_clipped_V)
+    log_data_V -= np.median(log_data_V[:100, :], axis=0)
+
+    # Plot Stokes I and Stokes V Dynamic Spectra
+    def plot_dynamic_spectrum(times, freqs, data, title="Dynamic Spectrum",
+                              cmap='viridis', vlabel="Relative Intensity (log)", vmin=None, vmax=None):
+        extent = [times[0].plot_date, times[-1].plot_date, freqs[0], freqs[-1]]
+        plt.figure(figsize=(10, 6))
+        plt.imshow(data.T, origin='lower', aspect='auto', extent=extent,
+                   cmap=cmap, vmin=vmin, vmax=vmax)
+        plt.colorbar(label=vlabel)
+        plt.xlabel('Time (UTC)')
+        plt.ylabel('Frequency (MHz)')
+        plt.title(title)
+
+        ax = plt.gca()
+        ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+        ax.xaxis.set_major_locator(MinuteLocator(interval=15))
+        ax.xaxis.set_minor_locator(MinuteLocator(interval=5))
+        plt.grid(True, which='both', alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    # Plot Stokes I and Stokes V Dynamic Spectra
+    plot_dynamic_spectrum(times, freqs, log_data_I,
+                          title="NDA Stokes I Dynamic Spectrum (log)", cmap='viridis', vmin=0, vmax=0.1)
+
+    plot_dynamic_spectrum(times, freqs, log_data_V,
+                          title="NDA Stokes V Dynamic Spectrum (log)", cmap='viridis', vmin=0, vmax=0.1)
+
+
+# In[55]:
+
+
+# Ensure shape match if needed (only if mismatch exists)
+if log_data_I.shape[0] > len(times):
+    log_data_I = log_data_I[:len(times), :]
+    log_data_V = log_data_V[:len(times), :]
+
+# Define zoom range
+t_start = Time('2025-01-31T13:45:00', format='isot')
+t_end = Time('2025-01-31T14:15:00', format='isot')
+f_min = 30  # MHz
+f_max = 70  # MHz
+
+# Apply masks
+time_mask = (times >= t_start) & (times <= t_end)
+freq_mask = (freqs >= f_min) & (freqs <= f_max)
+
+# Subset the processed data
+times_zoom = times[time_mask]
+freqs_zoom = freqs[freq_mask]
+log_data_I_zoom = log_data_I[time_mask, :][:, freq_mask]
+log_data_V_zoom = log_data_V[time_mask, :][:, freq_mask]
+
+# Plot zoomed-in spectra
+plot_dynamic_spectrum(times_zoom, freqs_zoom, log_data_I_zoom,
+                      title='Zoomed NDA Stokes I (log)', vmin=0, vmax=0.1)
+
+plot_dynamic_spectrum(times_zoom, freqs_zoom, log_data_V_zoom,
+                      title='Zoomed NDA Stokes V (log)', vmin=-0, vmax=0.1)
+
