@@ -1,0 +1,236 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timedelta
+import re
+from matplotlib.ticker import FixedLocator, FixedFormatter
+
+# Function to extract date from filename
+def extract_date_from_filename(filename):
+    """
+    Extract date from filename (e.g., LM151104.srs -> 2015-11-04).
+    
+    Parameters:
+    - filename: Path or name of the .srs file
+    
+    Returns:
+    - Date as a datetime object
+    """
+    match = re.search(r'LM(\d{2})(\d{2})(\d{2})\.srs', filename)
+    if not match:
+        raise ValueError("Filename must be in the format LMYYMMDD.srs")
+    year = 2000 + int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    return datetime(year, month, day)
+
+# Function to perform median subtraction
+def median_subtraction(data, window_size=200):
+    """
+    Apply median subtraction to remove background noise.
+    
+    Parameters:
+    - data: 2D array of intensity values (freq x time)
+    - window_size: Size of the rolling median window (in time steps)
+    
+    Returns:
+    - Median-subtracted data
+    """
+    median_spectrum = np.zeros_like(data)
+    for i in range(data.shape[0]):
+        for t in range(data.shape[1]):
+            start = max(0, t - window_size // 2)
+            end = min(data.shape[1], t + window_size // 2 + 1)
+            median_spectrum[i, t] = np.nanmedian(data[i, start:end])
+    return data - median_spectrum
+
+# Main function to read and plot the .srs file
+def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None, window_size=200):
+    """
+    Read and plot a dynamic spectrum and time profile from a Learmonth .srs file.
+    
+    Parameters:
+    - filename: Path to the .srs file
+    - time_start: Start time for zoom (str: 'YYYY-MM-DD HH:MM:SS'), or None for full range
+    - time_end: End time for zoom (str: 'YYYY-MM-DD HH:MM:SS'), or None for full range
+    - freq_range: Tuple of (freq_min, freq_max) in MHz for time profile, or None for full range
+    - window_size: Window size for median subtraction (in time steps)
+    """
+    # Extract date from filename
+    base_date = extract_date_from_filename(filename)
+    print(f"Base date extracted from filename: {base_date.strftime('%Y-%m-%d')}")
+
+    # Size of each spectrum: 24-byte header + 401 bytes (25-75 MHz) + 401 bytes (75-180 MHz)
+    specsize = 826
+
+    # Read the binary file
+    with open(filename, 'rb') as fid:
+        data = np.fromfile(fid, np.uint8)
+
+    # Calculate number of complete spectra
+    L = len(data)
+    specpday = L // specsize
+    data2 = np.reshape(data, (specpday, specsize)).T  # Shape: (826, specpday)
+    print(f"Number of spectra: {specpday}")
+
+    # Extract intensity data (bytes 25 to 824, 800 values)
+    spectra = data2[25:825, :]
+
+    # Generate frequency axis (400 points per band to match data)
+    fr1 = np.linspace(25, 75, 400)
+    fr2 = np.linspace(75, 180, 400)
+    freqs = np.concatenate((fr1, fr2))
+    print(f"Frequency range: {freqs[0]} to {freqs[-1]} MHz")
+
+    # Extract timestamp components
+    year = 2000 + data2[0, :]
+    month = data2[1, :]
+    day = data2[2, :]
+    hour = data2[3, :]
+    minute = data2[4, :]
+    second = data2[5, :]
+
+    # Generate time axis with validation
+    time_axis = []
+    fallback_base_time = base_date - timedelta(days=1)  # Start from previous day
+    fallback_base_time = fallback_base_time.replace(hour=22, minute=0, second=0)  # Assume start around 22:00 UT
+    for i in range(specpday):
+        if (0 <= hour[i] <= 23) and (0 <= minute[i] <= 59) and (0 <= second[i] <= 59):
+            try:
+                dt = datetime(year[i], month[i], day[i], hour[i], minute[i], second[i])
+                time_axis.append(dt)
+            except ValueError:
+                # Fallback to 3-second interval
+                time_axis.append(fallback_base_time + timedelta(seconds=i * 3))
+        else:
+            time_axis.append(fallback_base_time + timedelta(seconds=i * 3))
+
+    print("Time Axis (first 5 and last 5):")
+    print("First 5:", [dt.strftime('%Y-%m-%d %H:%M:%S') for dt in time_axis[:5]])
+    print("Last 5:", [dt.strftime('%Y-%m-%d %H:%M:%S') for dt in time_axis[-5:]])
+
+    # Scale intensity from 0-255 to -100 to 0 dBm (already linear)
+    spectra = -100 + (spectra / 255.0) * 100
+
+    # Apply median subtraction
+    spectra = median_subtraction(spectra, window_size=window_size)
+
+    # Determine frequency range for time profile
+    if freq_range is None:
+        freq_range = (25, 180)  # Default to full range
+    freq_min, freq_max = freq_range
+    freq_mask = (freqs >= freq_min) & (freqs <= freq_max)
+    if not np.any(freq_mask):
+        raise ValueError(f"Frequency range {freq_range} MHz is outside data range (25–180 MHz)")
+    spectra_for_time_profile = spectra[freq_mask, :]
+    freq_range_str = f"{freq_min}-{freq_max} MHz"
+    print(f"Time profile frequency range: {freq_range_str}")
+
+    # Compute time profile (average intensity over selected frequency range)
+    time_profile = np.nanmean(spectra_for_time_profile, axis=0)
+
+    # Determine time range for plotting
+    time_nums = mdates.date2num(time_axis)
+    if time_start and time_end:
+        start_dt = datetime.strptime(time_start, '%Y-%m-%d %H:%M:%S')
+        end_dt = datetime.strptime(time_end, '%Y-%m-%d %H:%M:%S')
+        start_idx = np.argmax(time_nums >= mdates.date2num(start_dt))
+        end_idx = np.argmax(time_nums >= mdates.date2num(end_dt))
+        if end_idx == 0:  # If end time is beyond data, use the last index
+            end_idx = len(time_nums) - 1
+        time_nums_plot = time_nums[start_idx:end_idx+1]
+        spectra_plot = spectra[:, start_idx:end_idx+1]
+        time_profile_plot = time_profile[start_idx:end_idx+1]
+    else:
+        time_nums_plot = time_nums
+        spectra_plot = spectra
+        time_profile_plot = time_profile
+        start_idx, end_idx = 0, len(time_nums) - 1
+
+    # Define major ticks for y-axis
+    major_ticks = [25, 50, 75, 100, 150, 180]
+
+    # Plot 1: Dynamic Spectrum with Logarithmic Y-Axis (Linear Intensity Scale)
+    fig1, ax1 = plt.subplots(figsize=(12, 8))
+    vmin = np.nanpercentile(spectra_plot, 5)
+    vmax = np.nanpercentile(spectra_plot, 95)
+    # Plot intensity on a linear scale
+    cax1 = ax1.pcolormesh(time_nums_plot, freqs, spectra_plot, cmap='jet', vmin=vmin, vmax=vmax)
+    fig1.colorbar(cax1, ax=ax1, label='Intensity [dBm, median-subtracted]')
+
+    # Set y-axis to logarithmic scale with custom ticks
+    ax1.set_yscale('log')
+    ax1.set_ylim(25, 180)
+    ax1.yaxis.set_major_locator(FixedLocator(major_ticks))
+    ax1.yaxis.set_major_formatter(FixedFormatter([str(int(tick)) for tick in major_ticks]))
+    ax1.yaxis.set_minor_locator(plt.NullLocator())
+
+    # Format time axis
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+    fig1.autofmt_xdate()
+
+    ax1.set_xlabel('Time (UT)')
+    ax1.set_ylabel('Frequency (MHz)')
+    ax1.set_title(f'Learmonth Solar Spectra (Log Y-Axis, Linear Intensity) ({base_date.strftime("%Y-%m-%d")})')
+
+    # Save the plot
+    output_filename_log = f'LEAR_{base_date.strftime("%Y%m%d")}_log.png'
+    plt.savefig(output_filename_log)
+    print(f"Log y-axis plot saved as {output_filename_log}")
+
+    # Plot 2: Dynamic Spectrum with Linear Y-Axis (Linear Intensity Scale)
+    fig2, ax2 = plt.subplots(figsize=(12, 8))
+    # Plot intensity on a linear scale
+    cax2 = ax2.pcolormesh(time_nums_plot, freqs, spectra_plot, cmap='jet', vmin=vmin, vmax=vmax)
+    fig2.colorbar(cax2, ax=ax2, label='Intensity [dBm, median-subtracted]')
+
+    # Set y-axis to linear scale with the same major ticks
+    ax2.set_ylim(25, 180)
+    ax2.set_yticks(major_ticks)
+    ax2.set_yticklabels([str(int(tick)) for tick in major_ticks])
+    ax2.set_aspect('auto')
+
+    # Format time axis
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+    fig2.autofmt_xdate()
+
+    ax2.set_xlabel('Time (UT)')
+    ax2.set_ylabel('Frequency (MHz)')
+    ax2.set_title(f'Learmonth Solar Spectra (Linear Y-Axis, Linear Intensity) ({base_date.strftime("%Y-%m-%d")})')
+
+    # Save the plot
+    output_filename_linear = f'LEAR_{base_date.strftime("%Y%m%d")}_linear.png'
+    plt.savefig(output_filename_linear)
+    print(f"Linear y-axis plot saved as {output_filename_linear}")
+
+    # Plot 3: Time Profile (Linear Intensity Scale)
+    fig3, ax3 = plt.subplots(figsize=(12, 4))
+    ax3.plot(time_nums_plot, time_profile_plot, color='black', linewidth=1)
+
+    # Format time axis
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    ax3.xaxis.set_major_locator(mdates.AutoDateLocator())
+    fig3.autofmt_xdate()
+
+    ax3.set_xlabel('Time (UT)')
+    ax3.set_ylabel('Average Intensity (dBm)')
+    ax3.set_title(f'Learmonth Time Profile ({freq_range_str}) ({base_date.strftime("%Y-%m-%d")})')
+    ax3.grid(True)
+
+    # Save the plot
+    output_filename_time = f'LEAR_{base_date.strftime("%Y%m%d")}_time_profile_{freq_min}_{freq_max}.png'
+    plt.savefig(output_filename_time)
+    print(f"Time profile plot saved as {output_filename_time}")
+
+    # Show all plots
+    plt.show()
+
+# Example usage
+filename = 'downloaded_data/LM151104.srs'
+time_start = '2015-11-04 02:00:00'  # Zoom to this time
+time_end = '2015-11-04 03:30:00'
+freq_range = (25, 75)  # Frequency range for time profile (e.g., 25-75 MHz)
+plot_learmonth_srs(filename, time_start=time_start, time_end=time_end, freq_range=freq_range, window_size=200)
