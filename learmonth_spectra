@@ -1,0 +1,72 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# Size of each spectrum
+specsize = 826
+
+# Read the binary file
+with open('downloaded_data/LM151104.srs', 'rb') as fid:
+    data = np.fromfile(fid, np.uint8)
+
+# Calculate number of complete spectra
+L = len(data)
+specpday = L // specsize
+data2 = np.reshape(data, (specpday, specsize)).T
+
+# Extract intensity data
+spectra = data2[25:825, :]
+
+# Generate frequency axis (adjusted to 400 points per band)
+fr1 = np.linspace(25, 75, 400)
+fr2 = np.linspace(75, 180, 400)
+fr = np.concatenate((fr1, fr2))
+
+# Generate time axis with validation
+year = 2000 + data2[0, :]
+month = data2[1, :]
+day = data2[2, :]
+hour = data2[3, :]
+minute = data2[4, :]
+second = data2[5, :]
+
+# Validate timestamps and compute time axis
+time_axis = []
+base_time = datetime(2015, 11, 3, 21, 41, 50)  # From your first scan
+for i in range(specpday):
+    if (0 <= hour[i] <= 23) and (0 <= minute[i] <= 59) and (0 <= second[i] <= 59):
+        try:
+            dt = datetime(year[i], month[i], day[i], hour[i], minute[i], second[i])
+            time_axis.append(dt)
+        except ValueError:
+            # Fallback to 3-second interval if timestamp is invalid
+            time_axis.append(base_time + timedelta(seconds=i * 3))
+    else:
+        time_axis.append(base_time + timedelta(seconds=i * 3))
+
+# Convert to decimal hours for plotting
+time_decimal = np.array([(dt.hour + dt.minute / 60 + dt.second / 3600) for dt in time_axis])
+
+# Print time and frequency axes
+print("Frequency Axis (first 5 and last 5, in MHz):")
+print(f"First 5: {fr[:5]}")
+print(f"Last 5: {fr[-5:]}")
+print("\nTime Axis (first 5 and last 5 of plotted range, in decimal hours):")
+print("First 5 (spectra 3000–3004):")
+for i in range(3000, 3005):
+    print(f"{time_axis[i]} → {time_decimal[i]:.6f} hours")
+print("Last 5 (spectra 15442–15446):")
+for i in range(specpday-5, specpday):
+    print(f"{time_axis[i]} → {time_decimal[i]:.6f} hours")
+
+# Plot the spectrogram
+extent = (time_decimal[3000], time_decimal[-1], fr[0], fr[-1])
+plt.imshow(np.flipud(spectra[:, 3000:]), extent=extent, aspect='auto', cmap='jet')
+plt.tick_params(labelsize=14)
+plt.xlabel('Universal Time (UT)', fontsize=15)
+plt.ylabel('Frequency (MHz)', fontsize=15)
+plt.title('Learmonth Solar Spectra', fontsize=15)
+#plt.xlim(1, 9)
+plt.savefig('LEAR_20151104.png')  # Corrected filename
+plt.show()
