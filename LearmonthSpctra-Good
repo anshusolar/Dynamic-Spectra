@@ -46,15 +46,15 @@ def median_subtraction(data, window_size=200):
     return data - median_spectrum
 
 # Main function to read and plot the .srs file
-def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None, window_size=200):
+def plot_learmonth_srs(filename, time_start=None, time_end=None, freqs_for_profile=None, window_size=200):
     """
-    Read and plot a dynamic spectrum and time profile from a Learmonth .srs file.
+    Read and plot a dynamic spectrum and time profiles at specific frequencies from a Learmonth .srs file.
     
     Parameters:
     - filename: Path to the .srs file
     - time_start: Start time for zoom (str: 'YYYY-MM-DD HH:MM:SS'), or None for full range
     - time_end: End time for zoom (str: 'YYYY-MM-DD HH:MM:SS'), or None for full range
-    - freq_range: Tuple of (freq_min, freq_max) in MHz for time profile, or None for full range
+    - freqs_for_profile: List of frequencies in MHz to plot time profiles for (e.g., [30, 50, 150])
     - window_size: Window size for median subtraction (in time steps)
     """
     # Extract date from filename
@@ -110,25 +110,27 @@ def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None
     print("First 5:", [dt.strftime('%Y-%m-%d %H:%M:%S') for dt in time_axis[:5]])
     print("Last 5:", [dt.strftime('%Y-%m-%d %H:%M:%S') for dt in time_axis[-5:]])
 
-    # Scale intensity from 0-255 to -100 to 0 dBm (already linear)
+    # Scale intensity from 0-255 to -100 to 0 dBm (linear scale)
     spectra = -100 + (spectra / 255.0) * 100
 
     # Apply median subtraction
     spectra = median_subtraction(spectra, window_size=window_size)
 
-    # Determine frequency range for time profile
-    if freq_range is None:
-        freq_range = (25, 180)  # Default to full range
-    freq_min, freq_max = freq_range
-    freq_mask = (freqs >= freq_min) & (freqs <= freq_max)
-    if not np.any(freq_mask):
-        raise ValueError(f"Frequency range {freq_range} MHz is outside data range (25–180 MHz)")
-    spectra_for_time_profile = spectra[freq_mask, :]
-    freq_range_str = f"{freq_min}-{freq_max} MHz"
-    print(f"Time profile frequency range: {freq_range_str}")
+    # Determine frequencies for time profile
+    if freqs_for_profile is None:
+        freqs_for_profile = [30, 50, 150]  # Default frequencies
+    print(f"Time profile frequencies: {freqs_for_profile} MHz")
 
-    # Compute time profile (average intensity over selected frequency range)
-    time_profile = np.nanmean(spectra_for_time_profile, axis=0)
+    # Extract time profiles at specified frequencies
+    time_profiles = []
+    for target_freq in freqs_for_profile:
+        if not (25 <= target_freq <= 180):
+            raise ValueError(f"Frequency {target_freq} MHz is outside data range (25–180 MHz)")
+        # Find the closest frequency index
+        freq_idx = np.argmin(np.abs(freqs - target_freq))
+        actual_freq = freqs[freq_idx]
+        print(f"Target frequency {target_freq} MHz, using closest frequency {actual_freq:.2f} MHz")
+        time_profiles.append(spectra[freq_idx, :])
 
     # Determine time range for plotting
     time_nums = mdates.date2num(time_axis)
@@ -141,11 +143,11 @@ def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None
             end_idx = len(time_nums) - 1
         time_nums_plot = time_nums[start_idx:end_idx+1]
         spectra_plot = spectra[:, start_idx:end_idx+1]
-        time_profile_plot = time_profile[start_idx:end_idx+1]
+        time_profiles_plot = [profile[start_idx:end_idx+1] for profile in time_profiles]
     else:
         time_nums_plot = time_nums
         spectra_plot = spectra
-        time_profile_plot = time_profile
+        time_profiles_plot = time_profiles
         start_idx, end_idx = 0, len(time_nums) - 1
 
     # Define major ticks for y-axis
@@ -155,7 +157,6 @@ def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None
     fig1, ax1 = plt.subplots(figsize=(12, 8))
     vmin = np.nanpercentile(spectra_plot, 5)
     vmax = np.nanpercentile(spectra_plot, 95)
-    # Plot intensity on a linear scale
     cax1 = ax1.pcolormesh(time_nums_plot, freqs, spectra_plot, cmap='jet', vmin=vmin, vmax=vmax)
     fig1.colorbar(cax1, ax=ax1, label='Intensity [dBm, median-subtracted]')
 
@@ -182,7 +183,6 @@ def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None
 
     # Plot 2: Dynamic Spectrum with Linear Y-Axis (Linear Intensity Scale)
     fig2, ax2 = plt.subplots(figsize=(12, 8))
-    # Plot intensity on a linear scale
     cax2 = ax2.pcolormesh(time_nums_plot, freqs, spectra_plot, cmap='jet', vmin=vmin, vmax=vmax)
     fig2.colorbar(cax2, ax=ax2, label='Intensity [dBm, median-subtracted]')
 
@@ -206,9 +206,13 @@ def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None
     plt.savefig(output_filename_linear)
     print(f"Linear y-axis plot saved as {output_filename_linear}")
 
-    # Plot 3: Time Profile (Linear Intensity Scale)
+    # Plot 3: Time Profiles at Specific Frequencies
     fig3, ax3 = plt.subplots(figsize=(12, 4))
-    ax3.plot(time_nums_plot, time_profile_plot, color='black', linewidth=1)
+    colors = ['blue', 'green', 'red', 'purple', 'orange']  # Colors for different frequencies
+    for i, (freq, profile) in enumerate(zip(freqs_for_profile, time_profiles_plot)):
+        freq_idx = np.argmin(np.abs(freqs - freq))
+        actual_freq = freqs[freq_idx]
+        ax3.plot(time_nums_plot, profile, color=colors[i % len(colors)], linewidth=1, label=f'{actual_freq:.1f} MHz')
 
     # Format time axis
     ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
@@ -216,21 +220,23 @@ def plot_learmonth_srs(filename, time_start=None, time_end=None, freq_range=None
     fig3.autofmt_xdate()
 
     ax3.set_xlabel('Time (UT)')
-    ax3.set_ylabel('Average Intensity (dBm)')
-    ax3.set_title(f'Learmonth Time Profile ({freq_range_str}) ({base_date.strftime("%Y-%m-%d")})')
+    ax3.set_ylabel('Intensity (dBm)')
+    ax3.set_title(f'Learmonth Time Profiles ({base_date.strftime("%Y-%m-%d")})')
+    ax3.legend()
     ax3.grid(True)
 
     # Save the plot
-    output_filename_time = f'LEAR_{base_date.strftime("%Y%m%d")}_time_profile_{freq_min}_{freq_max}.png'
+    freq_str = '_'.join([str(int(f)) for f in freqs_for_profile])
+    output_filename_time = f'LEAR_{base_date.strftime("%Y%m%d")}_time_profiles_{freq_str}.png'
     plt.savefig(output_filename_time)
-    print(f"Time profile plot saved as {output_filename_time}")
+    print(f"Time profiles plot saved as {output_filename_time}")
 
     # Show all plots
     plt.show()
 
 # Example usage
 filename = 'downloaded_data/LM151104.srs'
-time_start = '2015-11-04 02:00:00'  # Zoom to this time
-time_end = '2015-11-04 03:30:00'
-freq_range = (25, 75)  # Frequency range for time profile (e.g., 25-75 MHz)
-plot_learmonth_srs(filename, time_start=time_start, time_end=time_end, freq_range=freq_range, window_size=200)
+time_start = '2015-11-04 01:00:00'  # Zoom to this time
+time_end = '2015-11-04 09:00:00'
+freqs_for_profile = [30, 50, 150]  # Frequencies for time profiles
+plot_learmonth_srs(filename, time_start=time_start, time_end=time_end, freqs_for_profile=freqs_for_profile, window_size=200)
