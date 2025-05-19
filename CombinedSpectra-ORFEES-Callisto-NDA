@@ -1,0 +1,282 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import gzip
+from astropy.io import fits
+import numpy as np
+import matplotlib.pyplot as plt
+from glob import glob
+from datetime import datetime, timedelta
+from astropy.time import Time, TimeDelta
+import matplotlib.dates as mdates
+from matplotlib.dates import DateFormatter, MinuteLocator, date2num
+from matplotlib.ticker import LogLocator, ScalarFormatter, NullFormatter
+from scipy.interpolate import RegularGridInterpolator
+
+# --- ORFEES Functions ---
+def preprocess_log_median(data, baseline_len=100):
+    """Convert data to log10 scale and subtract median over initial baseline_len time steps."""
+    data_clipped = np.clip(data, 1e-3, None)
+    log_data = np.log10(data_clipped)
+    median_baseline = np.median(log_data[:baseline_len, :], axis=0)
+    normalized_data = log_data - median_baseline
+    return normalized_data
+
+def load_orfees_data(fits_file, t_start, t_end, f_min, f_max):
+    """Load and process ORFEES Stokes I data with time and frequency zooming."""
+    try:
+        with fits.open(fits_file) as hdul:
+            freq_hdu = hdul[1].data
+            freqs = np.concatenate([
+                freq_hdu['FREQ_B1'][0],
+                freq_hdu['FREQ_B2'][0],
+                freq_hdu['FREQ_B3'][0],
+                freq_hdu['FREQ_B4'][0],
+                freq_hdu['FREQ_B5'][0]
+            ])
+            spec_hdu = hdul[2].data
+            data_i = np.hstack([
+                spec_hdu['STOKESI_B1'],
+                spec_hdu['STOKESI_B2'],
+                spec_hdu['STOKESI_B3'],
+                spec_hdu['STOKESI_B4'],
+                spec_hdu['STOKESI_B5']
+            ])
+            start_time = Time('2024-05-29T12:00:00', format='isot', scale='utc')
+            time_deltas = TimeDelta(np.arange(data_i.shape[0]) * 0.1, format='sec')
+            times = start_time + time_deltas
+            freq_indices = np.argsort(freqs)
+            freqs_sorted = freqs[freq_indices]
+            data_i_processed = preprocess_log_median(data_i)
+            data_i_processed = data_i_processed[:, freq_indices]
+            t_start = Time(t_start, format='isot')
+            t_end = Time(t_end, format='isot')
+            time_mask = (times >= t_start) & (times <= t_end)
+            freq_mask = (freqs_sorted >= f_min) & (freqs_sorted <= f_max)
+            times_zoom = times[time_mask]
+            freqs_zoom = freqs_sorted[freq_mask]
+            data_i_zoom = data_i_processed[time_mask][:, freq_mask]
+            print(f"ORFEES: Data shape: {data_i_zoom.shape}, Times: {times_zoom.shape}, Freqs: {freqs_zoom.shape}")
+            return times_zoom, freqs_zoom, data_i_zoom
+    except Exception as e:
+        print(f"Error processing ORFEES FITS file: {e}")
+        return None, None, None
+
+# --- CALLISTO Functions ---
+def load_callisto_data(file):
+    """Load CALLISTO FITS data."""
+    with fits.open(file) as hdu:
+        data = hdu[0].data.astype(np.float32)
+        hdr = hdu[0].header
+        t_start = hdr['CRVAL1']
+        dt = hdr['CDELT1']
+        nt = hdr['NAXIS1']
+        time_sec = t_start + dt * np.arange(nt)
+        date_str = hdr['DATE-OBS']
+        base_time = datetime.strptime(date_str, "%Y/%m/%d")
+        time_axis = np.array([base_time + timedelta(seconds=float(s)) for s in time_sec])
+        freqs = hdu[1].data['Frequency'][0]
+        return time_axis, freqs, data
+
+def process_callisto_data(file_pattern, data_dir, t_start, t_end, f_min, f_max):
+    """Combine and process CALLISTO data with zooming."""
+    full_pattern = f"{data_dir}/{file_pattern}"
+    files = sorted(glob(full_pattern))
+    print(f"CALLISTO: Number of files: {len(files)}")
+    if not files:
+        print(f"No CALLISTO files found matching {full_pattern}")
+        return None, None, None
+
+    data_list = []
+    time_list = []
+    freqs = None
+    for file in files:
+        t, f, d = load_callisto_data(file)
+        time_list.append(t)
+        data_list.append(d)
+        if freqs is None:
+            freqs = f
+        elif not np.allclose(freqs, f):
+            print(f"Warning: Frequency mismatch in {file}")
+
+    freq_flipped = np.flip(freqs)[6:]
+    data_flipped = [np.flip(d, axis=0)[6:, :] for d in data_list]
+    time_combined = np.concatenate(time_list)
+    data_combined = np.hstack(data_flipped)
+
+    time_num = mdates.date2num(time_combined)
+    unique_times, unique_idx = np.unique(time_num, return_index=True)
+    time_combined = time_combined[unique_idx]
+    n_times = len(time_combined)
+    data_aligned = np.full((len(freq_flipped), n_times), np.nan)
+    idx = np.searchsorted(unique_times, time_num)
+    valid = (idx < n_times) & (idx >= 0)
+    idx = idx[valid]
+    if idx.size != data_combined.shape[1]:
+        print(f"Warning: CALLISTO time mismatch. Expected {data_combined.shape[1]}, got {idx.size}")
+        idx = idx[:data_combined.shape[1]]
+        data_combined = data_combined[:, :idx.size]
+    data_aligned[:, idx] = data_combined
+
+    median_spectrum = np.nanmedian(data_aligned, axis=1, keepdims=True)
+    data_subtracted = data_aligned - median_spectrum
+
+    t_start = Time(t_start, format='isot')
+    t_end = Time(t_end, format='isot')
+    time_astropy = Time(time_combined)
+    time_mask = (time_astropy >= t_start) & (time_astropy <= t_end)
+    freq_mask = (freq_flipped >= f_min) & (freq_flipped <= f_max)
+    times_zoom = time_combined[time_mask]
+    freqs_zoom = freq_flipped[freq_mask]
+    data_zoom = data_subtracted[freq_mask, :][:, time_mask]
+    print(f"CALLISTO: Data shape: {data_zoom.shape}, Times: {times_zoom.shape}, Freqs: {freqs_zoom.shape}")
+    return times_zoom, freqs_zoom, data_zoom
+
+# --- NDA Functions ---
+def load_nda_data(fits_file, t_start, t_end, f_min, f_max):
+    """Load and process NDA Stokes I data with zooming."""
+    try:
+        with fits.open(fits_file) as hdul:
+            date_obs = hdul[0].header['DATE-OBS']
+            try:
+                date_obs_iso = datetime.strptime(date_obs, '%d/%m/%Y').strftime('%Y-%m-%dT00:00:00')
+            except ValueError:
+                date_obs_iso = '2024-05-29T00:00:00'
+            data_i = hdul[1].data.T
+            freqs = hdul[3].data['frequency_in_MHz']
+            times = hdul[4].data['time_in_seconds']
+            if data_i.shape[0] > len(times):
+                data_i = data_i[:len(times), :]
+            t0 = Time(date_obs_iso)
+            times = t0 + TimeDelta(times, format='sec')
+            data_clipped = np.clip(data_i, 1e-3, None)
+            log_data = np.log10(data_clipped)
+            log_data -= np.median(log_data[:100, :], axis=0)
+            t_start = Time(t_start, format='isot')
+            t_end = Time(t_end, format='isot')
+            time_mask = (times >= t_start) & (times <= t_end)
+            freq_mask = (freqs >= f_min) & (freqs <= f_max)
+            times_zoom = times[time_mask]
+            freqs_zoom = freqs[freq_mask]
+            data_zoom = log_data[time_mask][:, freq_mask]
+            print(f"NDA: Data shape: {data_zoom.shape}, Times: {times_zoom.shape}, Freqs: {freqs_zoom.shape}")
+            return times_zoom, freqs_zoom, data_zoom
+    except Exception as e:
+        print(f"Error processing NDA FITS file: {e}")
+        return None, None, None
+
+# --- Combined Data Processing ---
+def combine_data(orfees_data, callisto_data, nda_data, time_range, f_min_total, f_max_total):
+    """Combine data from ORFEES, CALLISTO, and NDA into a single array."""
+    t_start, t_end = Time(time_range[0], format='isot'), Time(time_range[1], format='isot')
+    # Common time grid (0.1s resolution)
+    n_times = int((t_end - t_start).to_value('sec') / 0.1) + 1
+    time_grid = t_start + TimeDelta(np.arange(n_times) * 0.1, format='sec')
+    time_grid_mpl = date2num(time_grid.datetime)
+    time_edges = np.concatenate([time_grid_mpl, [time_grid_mpl[-1] + (time_grid_mpl[-1] - time_grid_mpl[-2])]])
+
+    # Collect all frequencies
+    freqs_all = []
+    if orfees_data[0] is not None:
+        freqs_all.append(orfees_data[1])
+    if callisto_data[0] is not None:
+        freqs_all.append(callisto_data[1])
+    if nda_data[0] is not None:
+        freqs_all.append(nda_data[1])
+    if not freqs_all:
+        raise ValueError("No valid frequency data available")
+    
+    # Combine and sort unique frequencies within total range
+    freqs_combined = np.unique(np.concatenate(freqs_all))
+    freqs_combined = freqs_combined[(freqs_combined >= f_min_total) & (freqs_combined <= f_max_total)]
+    freq_edges = np.concatenate([freqs_combined, [freqs_combined[-1] + (freqs_combined[-1] - freqs_combined[-2])]])
+
+    # Initialize combined data array
+    data_combined = np.full((n_times, len(freqs_combined)), np.nan)
+
+    # Interpolate each dataset
+    def interpolate_data(times, freqs, data, time_grid, freqs_combined):
+        if times is None or len(times) < 2 or len(freqs) < 2:
+            return np.full((len(time_grid), len(freqs_combined)), np.nan)
+        # Handle both astropy.time.Time and numpy.datetime arrays
+        time_num = date2num(times.datetime if isinstance(times, Time) else times)
+        # Normalize data (z-score)
+        data_norm = (data - np.nanmean(data)) / np.nanstd(data) if np.nanstd(data) != 0 else data
+        # Use RegularGridInterpolator
+        points = (time_num, freqs)
+        values = data_norm
+        interpolator = RegularGridInterpolator(points, values, method='linear', bounds_error=False, fill_value=np.nan)
+        # Create grid for interpolation
+        time_grid_mpl = date2num(time_grid.datetime)
+        time_mesh, freq_mesh = np.meshgrid(time_grid_mpl, freqs_combined, indexing='ij')
+        interp_points = np.vstack([time_mesh.ravel(), freq_mesh.ravel()]).T
+        data_interp = interpolator(interp_points).reshape(len(time_grid), len(freqs_combined))
+        return data_interp
+
+    # ORFEES
+    if orfees_data[0] is not None:
+        data_orfees = interpolate_data(orfees_data[0], orfees_data[1], orfees_data[2], time_grid, freqs_combined)
+        mask = (freqs_combined >= orfees_data[1].min()) & (freqs_combined <= orfees_data[1].max())
+        data_combined[:, mask] = data_orfees[:, mask]
+
+    # CALLISTO
+    if callisto_data[0] is not None:
+        # Transpose CALLISTO data to (n_times, n_freqs)
+        data_callisto = interpolate_data(callisto_data[0], callisto_data[1], callisto_data[2].T, time_grid, freqs_combined)
+        mask = (freqs_combined >= callisto_data[1].min()) & (freqs_combined <= callisto_data[1].max())
+        data_combined[:, mask] = data_callisto[:, mask]
+
+    # NDA
+    if nda_data[0] is not None:
+        data_nda = interpolate_data(nda_data[0], nda_data[1], nda_data[2], time_grid, freqs_combined)
+        mask = (freqs_combined >= nda_data[1].min()) & (freqs_combined <= nda_data[1].max())
+        data_combined[:, mask] = data_nda[:, mask]
+
+    return time_grid, freqs_combined, data_combined
+
+# --- Plotting ---
+def plot_combined_spectrum(time_grid, freqs, data, time_range, title):
+    """Plot a single dynamic spectrum."""
+    fig, ax = plt.subplots(figsize=(12, 8))
+    time_edges = date2num(time_grid.datetime)
+    time_edges = np.concatenate([time_edges, [time_edges[-1] + (time_edges[-1] - time_edges[-2])]])
+    freq_edges = np.concatenate([freqs, [freqs[-1] + (freqs[-1] - freqs[-2])]])
+    vmin, vmax = np.nanpercentile(data, [5, 95])  # Normalize for visibility
+    mesh = ax.pcolormesh(time_edges, freq_edges, data.T, cmap='viridis', vmin=vmin, vmax=vmax, shading='auto')
+    fig.colorbar(mesh, ax=ax, label='Normalized Intensity (z-score)')
+    ax.set_yscale('log')
+    ax.yaxis.set_major_locator(LogLocator(base=10.0, subs=[1.0, 2.0, 5.0], numticks=15))
+    ax.yaxis.set_major_formatter(ScalarFormatter())
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.set_xlabel('Time (UT, 2024-05-29)')
+    ax.set_ylabel('Frequency (MHz)')
+    ax.set_title(title)
+    ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+    ax.xaxis.set_major_locator(MinuteLocator(interval=15))
+    ax.xaxis.set_minor_locator(MinuteLocator(interval=5))
+    t_start, t_end = Time(time_range[0], format='isot'), Time(time_range[1], format='isot')
+    ax.set_xlim(date2num(t_start.datetime), date2num(t_end.datetime))
+    ax.set_ylim(freqs.min(), freqs.max())
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig('combined_dynamic_spectrum_single.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# --- Main Execution ---
+orfees_file = 'int_orf20240529_120000_0.1.fts'
+callisto_dir = 'algeria_craag_20240529'
+callisto_pattern = 'ALGERIA-CRAAG_*_59.fit.gz'
+nda_file = 'NDA_29052024_1_12_00_00_15_35_57.fits'
+
+time_range = ('2024-05-29T14:20:00', '2024-05-29T15:00:00')
+f_min_total, f_max_total = 10, 700  # Combined frequency range
+
+# Load data
+orfees_data = load_orfees_data(orfees_file, time_range[0], time_range[1], f_min=144, f_max=700)
+callisto_data = process_callisto_data(callisto_pattern, callisto_dir, time_range[0], time_range[1], f_min=80, f_max=144)
+nda_data = load_nda_data(nda_file, time_range[0], time_range[1], f_min=10, f_max=80)
+
+# Combine and plot
+time_grid, freqs_combined, data_combined = combine_data(orfees_data, callisto_data, nda_data, time_range, f_min_total, f_max_total)
+plot_combined_spectrum(time_grid, freqs_combined, data_combined, time_range, 
+                      'Combined Dynamic Spectrum (ORFEES, CALLISTO, NDA) - 2024-05-29')
