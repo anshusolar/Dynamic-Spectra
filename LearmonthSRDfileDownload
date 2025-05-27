@@ -1,0 +1,25 @@
+import requests
+import os
+
+def download_srd_file(year, date, output_dir='.'):
+    """Download Learmonth SRD file for a given date."""
+    filename = f'L{date}.SRD'
+    url = f'https://downloads.sws.bom.gov.au/wdc/wdc_solradio/data/learmonth/SRD/{year}/{filename}'
+    
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        filepath = os.path.join(output_dir, filename)
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f'Downloaded {filename} to {filepath}')
+        return filepath
+    except requests.exceptions.RequestException as e:
+        print(f'Failed to download {filename}: {e}')
+        return None
+
+# Download L241104.SRD
+year = 2024
+date = '240510'  # YYMMDD for November 4, 2024
+download_srd_file(year, date)
