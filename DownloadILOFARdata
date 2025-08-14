@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+download_lofar_dat.py
+
+Downloads .dat files from a LOFAR directory (e.g. https://data.lofar.ie/2024/11/06/bst/standard/).
+It first attempts to parse the directory listing for *.dat links; if that fails it can
+try a pattern-based fallback (useful when you know the filename pattern).
+
+Dependencies:
+    pip install requests beautifulsoup4 tqdm
+"""
+
+import os
+import re
+from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+
+# ----------------- USER CONFIG -----------------
+BASE_URL = "https://data.lofar.ie/2024/11/06/bst/standard/"   # directory page (must end with /)
+OUT_DIR = "lofar_20241106"
+MAX_WORKERS = 6
+# Fallback pattern settings (only used if directory listing parsing yields nothing)
+USE_PATTERN_FALLBACK = True
+DATE_STR = "20241106"            # YYYYMMDD used in filename
+TIME_PART = "021110"             # example time part inside filename if known (set to None to skip)
+SUFFIX_MIN = 0                   # numeric suffix range to try
+SUFFIX_MAX = 200                 # inclusive (adjust higher if needed)
+SUFFIX_PAD = 3                   # zero padding width for suffix (e.g. 003)
+# ------------------------------------------------
+
+HEADERS = {"User-Agent": "lofar-dl-script/1.0 (+https://example.org)"}
+
+
+def list_dat_links_from_dir(base_url, timeout=30):
+    """Try to fetch the directory page and parse .dat links."""
+    try:
+        r = requests.get(base_url, headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+    except Exception as e:
+        print("Could not fetch directory page:", e)
+        return []
+
+    links = []
+    # Try BeautifulSoup parsing
+    try:
+        soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().endswith(".dat"):
+                full = urljoin(base_url, href)
+                links.append(full)
+    except Exception:
+        pass
+
+    # If not found via soup, try a regex fallback
+    if not links:
+        matches = re.findall(r'href=["\']([^"\']+\.dat)["\']', r.text, flags=re.IGNORECASE)
+        for href in matches:
+            links.append(urljoin(base_url, href))
+
+    # Unique and sorted
+    links = sorted(list(dict.fromkeys(links)))
+    return links
+
+
+def build_pattern_urls(base_url, date_str, time_part, suffix_min, suffix_max, pad):
+    """Construct candidate URLs using the pattern: {date}_{time}_bst_{suffix}.dat"""
+    urls = []
+    if time_part is None:
+        return urls
+    for i in range(suffix_min, suffix_max + 1):
+        fname = f"{date_str}_{time_part}_bst_{i:0{pad}d}.dat"
+        urls.append(urljoin(base_url, fname))
+    return urls
+
+
+def url_exists(url, timeout=15):
+    """Do a fast HEAD request (or small GET) to test existence."""
+    try:
+        r = requests.head(url, headers=HEADERS, allow_redirects=True, timeout=timeout)
+        if r.status_code == 200:
+            return True
+        # Some servers don't honor HEAD; try small GET
+        if r.status_code in (403, 405, 501):
+            r2 = requests.get(url, headers=HEADERS, stream=True, timeout=timeout)
+            return r2.status_code == 200
+    except Exception:
+        pass
+    return False
+
+
+def download_file(url, out_dir, timeout=120):
+    """Download a single file streaming to disk. Returns path or None."""
+    fname = os.path.basename(url.split("?", 1)[0])
+    dest = os.path.join(out_dir, fname)
+    if os.path.exists(dest):
+        return dest  # skip existing
+    try:
+        with requests.get(url, headers=HEADERS, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            os.makedirs(out_dir, exist_ok=True)
+            with open(dest + ".part", "wb") as fh:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        fh.write(chunk)
+            os.replace(dest + ".part", dest)
+        return dest
+    except Exception as e:
+        # cleanup partial file
+        if os.path.exists(dest + ".part"):
+            try:
+                os.remove(dest + ".part")
+            except Exception:
+                pass
+        # return None to indicate failure
+        return None
+
+
+def download_urls(urls, out_dir, max_workers=6):
+    """Download list of URLs concurrently with progress bar."""
+    os.makedirs(out_dir, exist_ok=True)
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as exe:
+        futures = {exe.submit(download_file, url, out_dir): url for url in urls}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Downloading", unit="file"):
+            url = futures[fut]
+            try:
+                out = fut.result()
+                if out:
+                    results.append((url, out, True))
+                else:
+                    results.append((url, None, False))
+            except Exception as e:
+                results.append((url, None, False))
+    return results
+
+
+def main():
+    print("Listing .dat links from directory:", BASE_URL)
+    links = list_dat_links_from_dir(BASE_URL)
+    if links:
+        print(f"Found {len(links)} .dat links. Starting download...")
+        res = download_urls(links, OUT_DIR, max_workers=MAX_WORKERS)
+        ok = sum(1 for r in res if r[2])
+        print(f"Finished. {ok}/{len(res)} downloaded successfully.")
+        return
+
+    print("No directory listing or no .dat links found.")
+    if USE_PATTERN_FALLBACK and TIME_PART is not None:
+        print("Attempting pattern fallback using time part:", TIME_PART)
+        cand_urls = build_pattern_urls(BASE_URL, DATE_STR, TIME_PART, SUFFIX_MIN, SUFFIX_MAX, SUFFIX_PAD)
+        # Check which URLs exist first (cheap filter)
+        print("Checking which candidate URLs exist (this may take a while)...")
+        existing = []
+        for u in tqdm(cand_urls, desc="Probing", unit="url"):
+            if url_exists(u):
+                existing.append(u)
+        if not existing:
+            print("No pattern-matching files found in the given suffix range.")
+            print("Tip: increase SUFFIX_MAX or adjust TIME_PART/DATE_STR to match filenames.")
+            return
+        print(f"Found {len(existing)} existing files. Downloading...")
+        res = download_urls(existing, OUT_DIR, max_workers=MAX_WORKERS)
+        ok = sum(1 for r in res if r[2])
+        print(f"Finished. {ok}/{len(res)} downloaded successfully.")
+        return
+
+    print("No files found. If directory listing is disabled, set USE_PATTERN_FALLBACK=True and provide correct DATE_STR and TIME_PART.")
+    return
+
+
+if __name__ == "__main__":
+    main()
