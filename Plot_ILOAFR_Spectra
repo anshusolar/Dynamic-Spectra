@@ -1,0 +1,116 @@
+import numpy as np
+import glob, os
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.dates import date2num, num2date
+
+# --------- helper: subband -> frequency mapping ----------
+def sb_to_freqs(sb=np.arange(488), clock=200.0):
+    def sb_to_freq_math(x, n): return ((n - 1) + (x / 512.0)) * (clock / 2.0)
+    sb_3 = np.arange(54, 454, 2)
+    sb_5 = np.arange(54, 454, 2)
+    sb_7 = np.arange(54, 290, 2)
+    freq_3 = sb_to_freq_math(sb_3, 1)
+    freq_5 = sb_to_freq_math(sb_5, 2)
+    freq_7 = sb_to_freq_math(sb_7, 3)
+    freq_all = np.concatenate((freq_3, freq_5, freq_7))
+    return freq_all[sb[0] : sb[-1] + 1]
+
+# --------- read one file and return times (date2num), freqs, data as (n_freq, n_time) ----------
+def process_file_to_freq_time(filename, subbands=np.arange(488), time_resolution_s=1.0):
+    raw = np.fromfile(filename)
+    ncols = len(subbands)
+    valid_len = (raw.size // ncols) * ncols
+    raw = raw[:valid_len]
+    ntime = valid_len // ncols
+    data = raw.reshape(ntime, ncols)   
+    obs_start = datetime.strptime(os.path.basename(filename)[:15], "%Y%m%d_%H%M%S")
+    times_dt = np.array([obs_start + timedelta(seconds=i * time_resolution_s) for i in range(ntime)])
+    times_num = date2num(times_dt)   
+    data = np.where(data <= 0, 1e-12, data)
+    logd = np.log10(data)
+    baseline = np.median(logd[:min(100, logd.shape[0]), :], axis=0)
+    data_F = (logd - baseline)       
+    freqs = sb_to_freqs(subbands)
+    return times_num, freqs, data_F.T
+
+# --------- combine all files ----------
+def combine_files(folder, sb_range=None):
+    files = glob.glob(os.path.join(folder, "*_00X.dat"))
+    if not files:
+        raise FileNotFoundError("No .dat files found in: " + folder)
+    files_sorted = sorted(files, key=lambda f: datetime.strptime(os.path.basename(f)[:15], "%Y%m%d_%H%M%S"))
+
+    t_list, d_list = [], []
+    freqs = None
+    last_time = None
+    for f in files_sorted:
+        tnum, freqs_f, data_ft = process_file_to_freq_time(f, subbands=sb_range if sb_range is not None else np.arange(488))
+        if freqs is None:
+            freqs = freqs_f
+        elif not np.allclose(freqs, freqs_f):
+            raise ValueError("Frequency grid mismatch in file: " + f)
+
+        if last_time is not None:
+            idx = np.searchsorted(tnum, last_time, side='right')
+            if idx >= len(tnum):
+                continue
+            tnum = tnum[idx:]
+            data_ft = data_ft[:, idx:]
+
+        if tnum.size > 0:
+            t_list.append(tnum)
+            d_list.append(data_ft)
+            last_time = tnum[-1]
+
+    times = np.concatenate(t_list)
+    data = np.hstack(d_list)  
+    if not np.all(np.diff(times) >= 0):
+        idx_sort = np.argsort(times)
+        times = times[idx_sort]
+        data = data[:, idx_sort]
+    return times, freqs, data
+
+# --------- plot full spectrogram ----------
+def plot_spectrogram(times, freqs, data, vmin_pct=10, vmax_pct=90, title="I-LOFAR Spectrogram"):
+    fig, ax = plt.subplots(figsize=(14,6))
+    vmin = np.percentile(data, vmin_pct)
+    vmax = np.percentile(data, vmax_pct)
+    pcm = ax.pcolormesh(times, freqs, data, shading='auto', cmap='inferno', vmin=vmin, vmax=vmax)
+    #ax.invert_yaxis()
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    ax.set_ylabel("Frequency (MHz)")
+    ax.set_xlabel("UTC")
+    #fig.colorbar(pcm, ax=ax, label='Relative intensity (log10 units)')
+   #plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+# --------- zoom function ----------
+def zoom_and_plot(times, freqs, data, start_dt, end_dt, fmin, fmax, vmin_pct=70, vmax_pct=90):
+    start_num = date2num(start_dt)
+    end_num = date2num(end_dt)
+    tidx = (times >= start_num) & (times <= end_num)
+    fidx = (freqs >= fmin) & (freqs <= fmax)
+    times_zoom = times[tidx]
+    freqs_zoom = freqs[fidx]
+    data_zoom = data[fidx, :][:, tidx]
+    vmin_pc=10
+    vmax_pc=99
+    plot_spectrogram(times_zoom, freqs_zoom, data_zoom, vmin_pc, vmax_pct)
+
+# ---------- Example usage ----------
+folder = "/home/anshu/Desktop/Work/20241106/lofar_20241106/"
+times, freqs, data = combine_files(folder)
+
+# Plot full
+plot_spectrogram(times, freqs, data)
+
+# Plot zoomed
+zoom_and_plot(times, freqs, data,
+              datetime(2024,11,6,13,40,20),
+              datetime(2024,11,6,14,10,20),
+              10, 144)
+
